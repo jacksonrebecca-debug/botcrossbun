@@ -256,6 +256,7 @@ class GlassBoxBot(ForecastBot):
     # forecasting-tools spins up many coroutines; keep a gentle concurrency cap so
     # the ensemble passes don't trip provider rate limits.
     _max_concurrent_questions = 2
+    _concurrency_limiter = asyncio.Semaphore(_max_concurrent_questions)
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
