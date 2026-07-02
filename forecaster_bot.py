@@ -228,7 +228,10 @@ async def _resolution_source_note(question) -> str:
 #  NOTE: verify these exact model IDs against openrouter.ai/models — provider
 #  names drift; these are the right shape, not guaranteed current strings.
 # =============================================================================
-DIVERSE_ENSEMBLE = True
+# NOTE: set to False for the first clean run (all passes on the known-fast default
+# model — no timeouts, no unverified model IDs). Flip back to True as your round-one
+# experiment once you've confirmed a clean sweep AND verified the pool's model IDs.
+DIVERSE_ENSEMBLE = False
 FORECASTER_POOL = [
     "openrouter/anthropic/claude-sonnet-4.6",
     "openrouter/openai/gpt-5",
@@ -262,7 +265,7 @@ class GlassBoxBot(ForecastBot):
         super().__init__(*args, **kwargs)
         # Build the diverse forecaster pool once, and a cycle to rotate through it.
         self._forecaster_pool = [
-            GeneralLlm(model=m, temperature=0.3, timeout=60, allowed_tries=2)
+            GeneralLlm(model=m, temperature=0.3, timeout=120, allowed_tries=3)
             for m in FORECASTER_POOL
         ]
         self._forecaster_cycle = itertools.cycle(self._forecaster_pool)
@@ -688,11 +691,11 @@ if __name__ == "__main__":
             "default": GeneralLlm(
                 model="openrouter/anthropic/claude-sonnet-4.6",  # the score lever
                 temperature=0.3,
-                timeout=60,
-                allowed_tries=2,
+                timeout=120,
+                allowed_tries=3,
             ),
             "parser": "openrouter/anthropic/claude-haiku-4.5",    # cheap, for structure_output + consistency
-            "researcher": "openrouter/anthropic/claude-sonnet-4.6",               
+            "researcher": "openrouter/anthropic/claude-sonnet-4.6",             
             "summarizer": "openrouter/anthropic/claude-haiku-4.5",
         },
     )
