@@ -692,7 +692,7 @@ if __name__ == "__main__":
                 allowed_tries=2,
             ),
             "parser": "openrouter/anthropic/claude-haiku-4.5",    # cheap, for structure_output + consistency
-            "researcher": "asknews/news-summaries",               # free search via Metaculus/AskNews
+            "researcher": "openrouter/anthropic/claude-sonnet-4.6",               
             "summarizer": "openrouter/anthropic/claude-haiku-4.5",
         },
     )
