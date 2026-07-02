@@ -37,12 +37,14 @@ Run:  python forecaster_bot.py --mode test_questions   (the unscored arena first
 
 import argparse
 import asyncio
+import itertools
 import logging
 import re
 import statistics
 from datetime import datetime
 
 import dotenv
+import httpx
 
 from forecasting_tools import (
     AskNewsSearcher,
@@ -143,12 +145,188 @@ def _coverage_recency_note(research_text: str, now: datetime) -> str:
     )
 
 
+# =============================================================================
+#  UPGRADE 1 — REASON FROM CLEAN DATA  (the resolution-source reader)
+#  Inspired by last season's winner (GreeneiBot2), which reads the actual page a
+#  question resolves against. Your own "coverage" lesson: the resolution SOURCE
+#  is not the modelling source. Many questions resolve off ONE specific page
+#  (a gov table, a tracker, a Wikipedia figure) whose URL sits in the criteria
+#  text. This block extracts those URLs, fetches them, strips the HTML to text,
+#  and drops the real page into the shared research so all passes read the
+#  ground truth, not just news about it. Toggle: remove the one call in
+#  run_research to disable. Free — no Exa/paid fetcher, just httpx.
+# =============================================================================
+_URL_RE = re.compile(r"https?://[^\s\)\]\"'>]+")
+_SCRIPT_RE = re.compile(r"<(script|style)[^>]*>.*?</\1>", re.DOTALL | re.IGNORECASE)
+_TAG_RE = re.compile(r"<[^>]+>")
+
+
+def _extract_resolution_urls(question) -> list[str]:
+    blob = " ".join(
+        s for s in [question.resolution_criteria, question.fine_print, question.background_info] if s
+    )
+    urls, seen = [], set()
+    for u in _URL_RE.findall(blob):
+        u = u.rstrip(".,);'\"")
+        low = u.lower()
+        if "metaculus.com" in low:  # skip self-links back to the question page
+            continue
+        if low.endswith((".png", ".jpg", ".jpeg", ".gif", ".svg", ".pdf", ".zip")):
+            continue
+        if u not in seen:
+            seen.add(u)
+            urls.append(u)
+    return urls[:2]  # cap at 2 — don't fan out into the whole internet
+
+
+async def _fetch_url_text(url: str, limit: int = 3000) -> str:
+    try:
+        async with httpx.AsyncClient(
+            timeout=15, follow_redirects=True,
+            headers={"User-Agent": "Mozilla/5.0 (compatible; forecasting-bot)"},
+        ) as client:
+            resp = await client.get(url)
+            resp.raise_for_status()
+            html = resp.text
+        text = _SCRIPT_RE.sub(" ", html)   # drop script/style blocks
+        text = _TAG_RE.sub(" ", text)      # strip remaining tags
+        text = re.sub(r"\s+", " ", text).strip()
+        return text[:limit]
+    except Exception:
+        return ""  # a bad/paywalled/JS page must never break research
+
+
+async def _resolution_source_note(question) -> str:
+    urls = _extract_resolution_urls(question)
+    if not urls:
+        return ""
+    chunks = []
+    for u in urls:
+        body = await _fetch_url_text(u)
+        if body:
+            chunks.append(f"[{u}]\n{body}")
+    if not chunks:
+        return ""
+    joined = "\n\n".join(chunks)
+    return clean_indents(
+        f"""
+
+        --- RESOLUTION SOURCE CONTENT (fetched from links in the criteria — the page this resolves against) ---
+        {joined}
+        --- end resolution source (note: static fetch only; JS-heavy or paywalled pages may be thin) ---
+        """
+    )
+
+
+# =============================================================================
+#  UPGRADE 2 — DIVERSE-MODEL ENSEMBLE  ("three passes from separate SOTA")
+#  The 3 ensemble passes normally all run the SAME model = three takes from one
+#  mind. Real diversity (the "wisdom of deliberating AI crowds" finding) needs
+#  DIFFERENT model families, so the disagreement carries signal, not just
+#  temperature noise. This pool rotates one pass per family. Toggle off ->
+#  falls back to the single "default" model.
+#  NOTE: verify these exact model IDs against openrouter.ai/models — provider
+#  names drift; these are the right shape, not guaranteed current strings.
+# =============================================================================
+DIVERSE_ENSEMBLE = True
+FORECASTER_POOL = [
+    "openrouter/anthropic/claude-sonnet-4.6",
+    "openrouter/openai/gpt-5",
+    "openrouter/google/gemini-2.5-pro",
+]
+
+# =============================================================================
+#  UPGRADE 3 — ReAct RESEARCH LOOP  ("keep a reason loop open for more data")
+#  One-shot research takes a single snapshot. A ReAct loop instead: search ->
+#  ask "what's still MISSING?" -> search for that gap -> repeat. smingers reported
+#  this was his single biggest score gain. THE RISK: a loop that keeps deciding it
+#  needs more will keep spending your AskNews quota. So MAX_REACT_STEPS is a HARD
+#  cap it can never exceed, and the loop also stops early the moment the model says
+#  the research is sufficient. Toggle off -> pure one-shot research.
+#  QUOTA MATH: each step is one more AskNews call, so a question costs up to
+#  (1 + MAX_REACT_STEPS) search calls. Keep the cap low (2) to stay in the free tier.
+# =============================================================================
+REACT_RESEARCH = True
+MAX_REACT_STEPS = 2
+
+
 class GlassBoxBot(ForecastBot):
     """Your forecaster, ported to run live on Metaculus."""
 
     # forecasting-tools spins up many coroutines; keep a gentle concurrency cap so
     # the ensemble passes don't trip provider rate limits.
     _max_concurrent_questions = 2
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        # Build the diverse forecaster pool once, and a cycle to rotate through it.
+        self._forecaster_pool = [
+            GeneralLlm(model=m, temperature=0.3, timeout=60, allowed_tries=2)
+            for m in FORECASTER_POOL
+        ]
+        self._forecaster_cycle = itertools.cycle(self._forecaster_pool)
+
+    def _next_forecaster_llm(self):
+        # UPGRADE 2: hand each pass the next model family in the rotation, so the
+        # 3 passes are 3 different minds. The model is picked synchronously at the
+        # top of each pass (before any await), so the concurrent passes each take a
+        # distinct model. Toggle off -> everyone uses the single "default".
+        if DIVERSE_ENSEMBLE:
+            return next(self._forecaster_cycle)
+        return self.get_llm("default", "llm")
+
+    # --- ReAct research helpers (UPGRADE 3) -------------------------------
+    async def _run_search(self, prompt: str) -> str:
+        # One search, via AskNews if configured else the researcher LLM. Reused by
+        # both the initial pass and every gap-filling follow-up.
+        researcher = self.get_llm("researcher")
+        if isinstance(researcher, str) and researcher.startswith("asknews"):
+            return await AskNewsSearcher().call_preconfigured_version(researcher, prompt)
+        return await self.get_llm("researcher", "llm").invoke(prompt)
+
+    async def _identify_gap(self, question, research_so_far: str) -> str | None:
+        # Ask a CHEAP model what one thing is still missing. Returns a short search
+        # query, or None if the research is already sufficient (the early-stop).
+        prompt = clean_indents(
+            f"""
+            You are refining research for a forecast. Below is the question and the research so far.
+            Identify the SINGLE most important piece of information still MISSING that could change
+            the forecast. If the research is already sufficient, reply with exactly: DONE
+            Otherwise reply with ONLY a short search query (a few words) for the missing piece.
+
+            Question: {question.question_text}
+            Resolution criteria: {question.resolution_criteria}
+
+            Research so far:
+            {research_so_far}
+            """
+        )
+        resp = (await self.get_llm("parser", "llm").invoke(prompt)).strip()
+        if not resp or "DONE" in resp.upper()[:8]:
+            return None
+        return resp[:120]  # keep the query short
+
+    async def _react_expand(self, question, research_so_far: str) -> str:
+        # The loop: up to MAX_REACT_STEPS follow-up searches, stopping early the
+        # moment the model says the research is sufficient. The range() is the HARD
+        # cap — it can never run more than MAX_REACT_STEPS searches, whatever happens.
+        if not REACT_RESEARCH:
+            return research_so_far
+        for step in range(MAX_REACT_STEPS):
+            gap = await self._identify_gap(question, research_so_far)
+            if not gap:
+                break  # model says we have enough — stop early
+            more = await self._run_search(
+                f"Regarding: {question.question_text}\nFind specifically: {gap}"
+            )
+            research_so_far += clean_indents(
+                f"""
+
+                --- FOLLOW-UP SEARCH (step {step + 1}/{MAX_REACT_STEPS}, filling gap: {gap}) ---
+                {more}
+                """
+            )
+        return research_so_far
 
     # ---------------------------------------------------------------------
     # 1. RESEARCH  +  OPERATIONALISE-AND-BIND   (run once per question, shared)
@@ -167,11 +345,8 @@ class GlassBoxBot(ForecastBot):
                 {question.fine_print}
                 """
             )
-            researcher = self.get_llm("researcher")
-            if isinstance(researcher, str) and researcher.startswith("asknews"):
-                news = await AskNewsSearcher().call_preconfigured_version(researcher, news_prompt)
-            else:
-                news = await self.get_llm("researcher", "llm").invoke(news_prompt)
+            news = await self._run_search(news_prompt)
+            news = await self._react_expand(question, news)   # UPGRADE 3: gap-filling research loop
 
             # --- (b) operationalise-and-bind: the crown jewel, ported.
             # For a MULTIPLE-CHOICE question, write the exact real-world condition
@@ -198,6 +373,7 @@ class GlassBoxBot(ForecastBot):
                 binding = await self.get_llm("default", "llm").invoke(rubric_prompt)
 
             research = news + _coverage_recency_note(news, datetime.now())
+            research += await _resolution_source_note(question)   # UPGRADE 1: read the actual resolution page
             if binding:
                 research += clean_indents(
                     f"""
@@ -242,7 +418,7 @@ class GlassBoxBot(ForecastBot):
             The last thing you write is: "Probability: ZZ%", 0-100.
             """
         )
-        reasoning = await self.get_llm("default", "llm").invoke(prompt)
+        reasoning = await self._next_forecaster_llm().invoke(prompt)  # UPGRADE 2: rotate model family per pass
         parsed: BinaryPrediction = await structure_output(
             reasoning, BinaryPrediction, model=self.get_llm("parser", "llm")
         )
@@ -282,7 +458,7 @@ class GlassBoxBot(ForecastBot):
             ...
             """
         )
-        reasoning = await self.get_llm("default", "llm").invoke(prompt)
+        reasoning = await self._next_forecaster_llm().invoke(prompt)  # UPGRADE 2: rotate model family per pass
 
         parsing_instructions = clean_indents(
             f"""
@@ -440,7 +616,7 @@ class GlassBoxBot(ForecastBot):
     async def _numeric_prompt_to_forecast(
         self, question: NumericQuestion, prompt: str
     ) -> ReasonedPrediction[NumericDistribution]:
-        reasoning = await self.get_llm("default", "llm").invoke(prompt)
+        reasoning = await self._next_forecaster_llm().invoke(prompt)  # UPGRADE 2: rotate model family per pass
         parsing_instructions = clean_indents(
             f"""
             The text is a forecast distribution for the numeric question: "{question.question_text}".
