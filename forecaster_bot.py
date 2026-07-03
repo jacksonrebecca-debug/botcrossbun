@@ -39,6 +39,7 @@ import argparse
 import asyncio
 import itertools
 import logging
+import os
 import re
 import statistics
 from datetime import datetime
@@ -377,6 +378,15 @@ class GlassBoxBot(ForecastBot):
                 binding = await self.get_llm("default", "llm").invoke(rubric_prompt)
 
             research = news + _coverage_recency_note(news, datetime.now())
+            # CONFIG STAMP: every posted comment records the exact configuration that
+            # produced it, so resolved MiniBench rounds are self-documenting and
+            # round-over-round comparisons (one toggle per round) need no notebook.
+            researcher_name = self.get_llm("researcher")
+            research += (
+                f"\n\n[config: diverse_ensemble={DIVERSE_ENSEMBLE}, react={REACT_RESEARCH}, "
+                f"asknews={isinstance(researcher_name, str) and researcher_name.startswith('asknews')}, "
+                f"passes={self.predictions_per_research_report}]"
+            )
             research += await _resolution_source_note(question)   # UPGRADE 1: read the actual resolution page
             if binding:
                 research += clean_indents(
@@ -695,7 +705,14 @@ if __name__ == "__main__":
                 allowed_tries=3,
             ),
             "parser": "openrouter/anthropic/claude-haiku-4.5",    # cheap, for structure_output + consistency
-            "researcher": "openrouter/anthropic/claude-sonnet-4.6",             
+            # AUTO-DETECT (backported from ppm_server): use AskNews the moment both
+            # secrets exist in the environment; otherwise fall back to LLM research.
+            # When AskNews credentials arrive: add the two GitHub Secrets — no code edit.
+            "researcher": (
+                "asknews/news-summaries"
+                if os.environ.get("ASKNEWS_CLIENT_ID") and os.environ.get("ASKNEWS_SECRET")
+                else "openrouter/anthropic/claude-sonnet-4.6"
+            ),
             "summarizer": "openrouter/anthropic/claude-haiku-4.5",
         },
     )
