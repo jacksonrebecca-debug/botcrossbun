@@ -253,6 +253,18 @@ FORECASTER_POOL = [
 REACT_RESEARCH = True
 MAX_REACT_STEPS = 2
 
+# =============================================================================
+#  UPGRADE 4 — BIND BINARY TOO  (aimed at the "Strategy bitcoin" class of miss)
+#  Binding originally fired only for multiple choice. But binary questions have
+#  cells too (YES / NO), and the sharpest documented misses are models reasoning
+#  correctly about the WORLD while the narrow criterion says otherwise (e.g.
+#  "structural net buyer" vs "did the reported total EVER fall below a prior
+#  total"). This pre-pass writes what YES and NO precisely mean — and names any
+#  gap between the headline reading and the narrow criterion — into the shared
+#  research. Toggleable: it is a round-two experiment like the others.
+# =============================================================================
+BIND_BINARY = True
+
 
 class GlassBoxBot(ForecastBot):
     """Your forecaster, ported to run live on Metaculus."""
@@ -376,6 +388,28 @@ class GlassBoxBot(ForecastBot):
                     """
                 )
                 binding = await self.get_llm("default", "llm").invoke(rubric_prompt)
+            elif BIND_BINARY and isinstance(question, BinaryQuestion):
+                # UPGRADE 4: binary questions have cells too. The classic miss is
+                # reasoning about the HEADLINE ("is Strategy a net buyer?") while the
+                # criterion is narrower ("did the reported total EVER dip below a
+                # prior total before the deadline?"). Write both cells' precise
+                # conditions, and name the gap, once, shared by all passes.
+                rubric_prompt = clean_indents(
+                    f"""
+                    Below is a binary forecasting question and its resolution criteria.
+                    State, tersely and precisely:
+                    YES => the exact real-world condition that resolves YES, per the criteria's own words.
+                    NO  => the exact real-world condition that resolves NO.
+                    GAP => any way the narrow criterion differs from the casual headline reading of the
+                    question (a threshold, an "ever/at any point" clause, a specific source or date, a
+                    weaker-than-headline trigger). If none, write "GAP => none".
+
+                    Question: {question.question_text}
+                    Resolution criteria: {question.resolution_criteria}
+                    {question.fine_print}
+                    """
+                )
+                binding = await self.get_llm("default", "llm").invoke(rubric_prompt)
 
             research = news + _coverage_recency_note(news, datetime.now())
             # CONFIG STAMP: every posted comment records the exact configuration that
@@ -384,6 +418,7 @@ class GlassBoxBot(ForecastBot):
             researcher_name = self.get_llm("researcher")
             research += (
                 f"\n\n[config: diverse_ensemble={DIVERSE_ENSEMBLE}, react={REACT_RESEARCH}, "
+                f"bind_binary={BIND_BINARY}, "
                 f"asknews={isinstance(researcher_name, str) and researcher_name.startswith('asknews')}, "
                 f"passes={self.predictions_per_research_report}]"
             )
@@ -426,6 +461,12 @@ class GlassBoxBot(ForecastBot):
             self-exciting (clusters — epidemics, volatility, unrest, viral spread) or memoryless, and
             if a COVERAGE RECENCY SIGNAL appears in the research, weigh it as a weak proxy for being
             inside a burst — only for self-exciting processes, never on the proxy alone.
+
+            If the event is NOVEL or the reference class is thin, use WIDENED PRIORS: name 3-5 ADJACENT
+            reference classes (each sharing part of the structure, each imperfect in a different way),
+            note a base rate from each, and average them into your working prior. If those rates roughly
+            agree, trust the prior; if they disagree widely, the prior is soft — stay humble and let
+            current evidence do more of the work.
 
             {TIME_AWARE_PRIOR}
 
@@ -566,6 +607,10 @@ class GlassBoxBot(ForecastBot):
 
             STEP 2a — If COUNT, build the base rate explicitly:
               - Name the reference class and how many events it saw over how long, i.e. rate = events / period.
+              - If the event is NOVEL or the class is thin, use WIDENED PRIORS: name 3-5 ADJACENT reference
+                classes (each imperfect in a DIFFERENT way), note a rate from each, and average them into
+                the working rate. Wide disagreement between those rates means a soft prior — widen your
+                final distribution accordingly.
               - State the exposure window until resolution.
               - CLUSTERING CHECK (do not skip). First CLASSIFY the process:
                 SELF-EXCITING (contagion / momentum / feedback — epidemics, market volatility, violence
