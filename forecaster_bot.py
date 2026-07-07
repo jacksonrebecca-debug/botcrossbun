@@ -750,12 +750,17 @@ if __name__ == "__main__":
                 allowed_tries=3,
             ),
             "parser": "openrouter/anthropic/claude-haiku-4.5",    # cheap, for structure_output + consistency
-            # AUTO-DETECT (backported from ppm_server): use AskNews the moment both
-            # secrets exist in the environment; otherwise fall back to LLM research.
-            # When AskNews credentials arrive: add the two GitHub Secrets — no code edit.
+            # AUTO-DETECT (backported from ppm_server): use AskNews the moment its
+            # credentials exist in the environment — EITHER the classic pair
+            # (ASKNEWS_CLIENT_ID + ASKNEWS_SECRET) OR the newer single key
+            # (ASKNEWS_API_KEY). Otherwise fall back to LLM research.
+            # When credentials arrive: add the GitHub Secret(s) — no code edit.
             "researcher": (
                 "asknews/news-summaries"
-                if os.environ.get("ASKNEWS_CLIENT_ID") and os.environ.get("ASKNEWS_SECRET")
+                if (
+                    (os.environ.get("ASKNEWS_CLIENT_ID") and os.environ.get("ASKNEWS_SECRET"))
+                    or os.environ.get("ASKNEWS_API_KEY")
+                )
                 else "openrouter/anthropic/claude-sonnet-4.6"
             ),
             "summarizer": "openrouter/anthropic/claude-haiku-4.5",
